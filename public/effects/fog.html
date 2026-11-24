@@ -1,0 +1,621 @@
+<!doctype html>
+<html lang="en" class="cam">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>fog: breathe on your screen</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="ui.css">
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection@0.4.1646425229/face_detection.js" crossorigin="anonymous"></script>
+</head>
+<body class="cam" style="touch-action:none">
+<video id="video" playsinline muted autoplay></video>
+<canvas id="view"></canvas>
+<canvas id="fx"></canvas>
+
+<div id="hud">
+  <button id="back" class="tool cam-back" title="Back to all filters (Esc)">&larr; Back</button>
+  <div class="dock">
+    <div class="group">
+      <label class="slider"><span>Brush</span><input id="brush" type="range" min="7" max="38" value="15"></label>
+      <button id="clear" class="tool" title="Fog the glass again (C)">Fog it again</button>
+      <button id="tips" class="tool" aria-pressed="true" title="Show or hide the how-to">Tips</button>
+    </div>
+    <div class="legend" id="legend">
+      <div><b>Breathe</b>on the screen, or hold Space</div>
+      <div><b>Pinch</b>thumb and finger to draw</div>
+      <div><b>Fist</b>wipe it clear</div>
+    </div>
+    <button id="shutter" class="btn" title="Save photo (S)"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l1.6-2.4h6.8L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.6"/></svg>Save photo</button>
+  </div>
+</div>
+<div id="flash"></div>
+<div id="toast" role="status"></div>
+<div id="banner"></div>
+
+<main id="start">
+  <a class="back tool" href="/effects">&larr; All filters</a>
+  <h1 style="--h1: clamp(160px, 34vw, 560px); --h1-m: clamp(140px, 44vw, 260px)">Fog</h1>
+  <div class="panel">
+    <p class="lead">A bathroom mirror that just fogged up. Clear it any way you like.</p>
+    <ul class="gestures">
+      <li><b>Breathe</b><span>on your screen, or hold Space, to fog the glass</span></li>
+      <li><b>Pinch</b><span>thumb to index finger to draw in the fog</span></li>
+      <li><b>Fist</b><span>wipe the fog away. Or just drag with the mouse or a finger.</span></li>
+    </ul>
+    <button id="go" class="btn">Start camera</button>
+    <div id="startMsg" role="status"></div>
+    <p class="privacy">Everything runs in your browser. No frames, audio or data leave this machine.</p>
+  </div>
+</main>
+
+<script>
+'use strict';
+
+const HANDS_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/';
+const FACE_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/face_detection@0.4.1646425229/';
+
+// Tuned values from a working build.
+const C = {
+  fogStart: 0.55,
+  blur: 18, brightness: 1.18, tint: 'rgba(242,238,231,0.62)',
+  blobs: 12, blobAlpha: 0.36, blobBlur: 0.60, reach: 0.43, spreadX: 1.45, dropY: 0.06,
+  floorDown: 0.05, floorUp: 0.0008, breathOn: 0.0025, breathFull: 0.003, keyQuietMs: 300,
+  faceEvery: 5, faceEase: 0.4,
+  pinchDown: 0.22, pinchUp: 0.38, releaseMs: 250, releaseFrames: 2,
+  penEase1: 0.45, penEase2: 0.22, tremor: 0.0006, starEase: 0.55,
+  wipeScale: 1.5, wipeStamp: 0.2, wipeStep: 0.16, wipeMaxStamps: 140, wipeJump: 0.30, wipeEase: 0.5,
+  dropsMax: 12, dropSpawn: 0.035,
+};
+
+const $ = id => document.getElementById(id);
+const video = $('video'), view = $('view'), fx = $('fx');
+const vctx = view.getContext('2d'), fctx = fx.getContext('2d');
+const fogCanvas = document.createElement('canvas'), fogCtx = fogCanvas.getContext('2d');
+const frostCanvas = document.createElement('canvas'), frostCtx = frostCanvas.getContext('2d');
+const smallCanvas = document.createElement('canvas'), smallCtx = smallCanvas.getContext('2d');
+const CAN_FILTER = 'filter' in CanvasRenderingContext2D.prototype;
+
+let DPR = 1, W = 0, H = 0;
+const L = { scale: 1, dx: 0, dy: 0, dw: 1, dh: 1, vw: 1, vh: 1 };
+
+let running = false, rafId = 0, frameN = 0;
+let stream = null, audioCtx = null, analyser = null, abuf = null, micOk = false;
+let hands = null, face = null, handsBusy = false, faceBusy = false;
+
+// breath
+let floor = null, lastKeyMs = 0, spaceHeld = false;
+const fogC = { x: 0, y: 0 }, mouth = { x: 0, y: 0 };
+
+// pen
+let penDown = false, releasedFrames = 0, lastPinchMs = 0;
+let penRaw = { x: 0, y: 0 }, rawAcc = { x: 0, y: 0 }, tgt = { x: 0, y: 0 }, brush = { x: 0, y: 0 };
+let lastPt = { x: 0, y: 0 }, lastMid = { x: 0, y: 0 };
+const pinchPt = { x: 0, y: 0 }, star = { x: 0, y: 0 };
+let starA = 0;
+
+// wipe
+let lastWipe = null, wipeSm = null;
+
+// mouse / touch: drag to wipe
+let pointerLast = null;
+
+// condensation drops that run down the glass
+const drops = [];
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const brushPx = () => Number($('brush').value) * DPR;
+
+// ---------- sizing ----------
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(innerWidth * DPR)), h = Math.max(1, Math.round(innerHeight * DPR));
+  if (w === W && h === H) return;
+  let old = null;
+  if (W) {
+    old = document.createElement('canvas');
+    old.width = W; old.height = H;
+    old.getContext('2d').drawImage(fogCanvas, 0, 0);
+  }
+  W = w; H = h;
+  view.width = fx.width = fogCanvas.width = frostCanvas.width = W;
+  view.height = fx.height = fogCanvas.height = frostCanvas.height = H;
+  smallCanvas.width = Math.max(1, Math.round(W / 12));
+  smallCanvas.height = Math.max(1, Math.round(H / 12));
+  if (old) fogCtx.drawImage(old, 0, 0, W, H); else resetFog();
+}
+
+function resetFog() {
+  fogCtx.globalCompositeOperation = 'source-over';
+  fogCtx.clearRect(0, 0, W, H);
+  fogCtx.fillStyle = `rgba(255,255,255,${C.fogStart})`;
+  fogCtx.fillRect(0, 0, W, H);
+  drops.length = 0;
+}
+
+function layout() {
+  L.vw = video.videoWidth || W; L.vh = video.videoHeight || H;
+  L.scale = Math.max(W / L.vw, H / L.vh);
+  L.dw = L.vw * L.scale; L.dh = L.vh * L.scale;
+  L.dx = (W - L.dw) / 2; L.dy = (H - L.dh) / 2;
+}
+// normalized (unmirrored) camera coords -> screen pixels of the mirrored view
+const toScreen = p => ({ x: W - (L.dx + p.x * L.dw), y: L.dy + p.y * L.dh });
+const vdist = (a, b) => Math.hypot((a.x - b.x) * L.vw, (a.y - b.y) * L.vh);
+
+// ---------- camera / mic ----------
+async function acquire() {
+  const videoC = { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' };
+  const audioC = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+  micOk = true;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: videoC, audio: audioC });
+  } catch (e) {
+    console.warn('camera+mic request failed, retrying camera only', e);
+    stream = await navigator.mediaDevices.getUserMedia({ video: videoC });
+    micOk = false;
+  }
+  video.srcObject = stream;
+  await video.play();
+  if (!video.videoWidth) await new Promise(r => video.addEventListener('loadedmetadata', r, { once: true }));
+
+  if (stream.getAudioTracks().length) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await audioCtx.resume();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0;
+    abuf = new Float32Array(analyser.fftSize);
+    audioCtx.createMediaStreamSource(stream).connect(analyser); // not routed to speakers
+  } else {
+    micOk = false;
+  }
+}
+
+async function loadTrackers() {
+  if (!hands) {
+    hands = new Hands({ locateFile: f => HANDS_BASE + f });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5, selfieMode: false });
+    hands.onResults(onHands);
+    await hands.initialize();
+  }
+  if (!face) {
+    face = new FaceDetection({ locateFile: f => FACE_BASE + f });
+    face.setOptions({ model: 'short', minDetectionConfidence: 0.5, selfieMode: false });
+    face.onResults(onFace);
+    await face.initialize();
+  }
+}
+
+function stopMedia() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null;
+  if (audioCtx) audioCtx.close();
+  audioCtx = null; analyser = null; floor = null;
+}
+
+// ---------- start / stop ----------
+function startError(e) {
+  console.error(e);
+  const name = e && e.name;
+  let msg;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    msg = 'This page needs https or localhost for camera access. Serve this folder with <code>python -m http.server</code> and open <code>http://localhost:8000/fog.html</code>.';
+  } else if (name === 'NotAllowedError' || name === 'SecurityError') {
+    msg = 'Camera access was refused. Allow the camera for this page in your browser settings, then press Start camera again.';
+  } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+    msg = 'No camera was found.';
+  } else if (name === 'NotReadableError') {
+    msg = 'The camera is in use by another app. Close it and press Start camera again.';
+  } else if (typeof Hands === 'undefined' || typeof FaceDetection === 'undefined') {
+    msg = 'Could not load MediaPipe from the CDN. Check your connection.';
+  } else {
+    msg = 'Something went wrong: ' + ((e && e.message) || e);
+  }
+  $('startMsg').innerHTML = msg;
+}
+
+async function start() {
+  const go = $('go');
+  go.disabled = true; $('startMsg').textContent = '';
+  try {
+    go.textContent = 'Starting camera…';
+    await acquire();
+    go.textContent = 'Loading hand tracking…';
+    await loadTrackers();
+  } catch (e) {
+    stopMedia();
+    startError(e);
+    go.disabled = false; go.textContent = 'Start camera';
+    return;
+  }
+  go.disabled = false; go.textContent = 'Start camera';
+  $('start').style.display = 'none';
+  $('hud').classList.add('on');
+  if (!micOk) toast('No microphone, so hold Space to fog the glass.');
+
+  resize(); resetFog();
+  fogC.x = mouth.x = W / 2; fogC.y = mouth.y = H * 0.6;
+  penDown = false; lastWipe = null; starA = 0; frameN = 0; handsBusy = faceBusy = false;
+  running = true;
+  rafId = requestAnimationFrame(frame);
+}
+
+function stop() {
+  if (!running) return;
+  running = false;
+  cancelAnimationFrame(rafId);
+  stopMedia();
+  penDown = false; lastWipe = null; wipeSm = null; pointerLast = null; spaceHeld = false;
+  fctx.clearRect(0, 0, W, H);
+  $('hud').classList.remove('on');
+  $('start').style.display = '';
+}
+
+// ---------- tracking ----------
+function pumpTrackers() {
+  if (video.readyState < 2 || !video.videoWidth) return;
+  if (!handsBusy) {
+    handsBusy = true;
+    hands.send({ image: video }).then(() => { handsBusy = false; }, e => { handsBusy = false; throw e; });
+  }
+  if (frameN % C.faceEvery === 0 && !faceBusy) {
+    faceBusy = true;
+    face.send({ image: video }).then(() => { faceBusy = false; }, e => { faceBusy = false; throw e; });
+  }
+}
+
+function onFace(res) {
+  if (!running) return;
+  const d = res.detections && res.detections[0];
+  if (!d) return;
+  let p = d.landmarks && d.landmarks[3]; // mouth centre
+  if (!p && d.boundingBox) p = { x: d.boundingBox.xCenter, y: d.boundingBox.yCenter + d.boundingBox.height * 0.3 };
+  if (p) { const s = toScreen(p); mouth.x = s.x; mouth.y = s.y; }
+}
+
+function isFist(l) {
+  const wr = l[0];
+  return [[8, 6], [12, 10], [16, 14], [20, 18]].every(([tip, pip]) => vdist(l[tip], wr) < vdist(l[pip], wr));
+}
+
+function onHands(res) {
+  if (!running) return;
+  const now = performance.now();
+  const l = res.multiHandLandmarks && res.multiHandLandmarks[0];
+  if (!l) { lastWipe = null; released(now); return; }
+
+  layout();
+  const ratio = vdist(l[4], l[8]) / Math.max(vdist(l[0], l[9]), 1e-6);
+  const a = toScreen(l[4]), b = toScreen(l[8]);
+  pinchPt.x = (a.x + b.x) / 2; pinchPt.y = (a.y + b.y) / 2;
+
+  if (penDown) {
+    if (ratio < C.pinchUp) {
+      lastPinchMs = now; releasedFrames = 0;
+      if (Math.hypot(pinchPt.x - rawAcc.x, pinchPt.y - rawAcc.y) >= C.tremor * W) { rawAcc.x = pinchPt.x; rawAcc.y = pinchPt.y; }
+      penRaw = rawAcc;
+    } else {
+      released(now);
+    }
+    return;
+  }
+
+  const fist = isFist(l);
+  // The extended-index check only runs at pen-down; a thumb resting on a curled index must not draw.
+  const indexExtended = vdist(l[8], l[0]) > vdist(l[6], l[0]);
+  if (ratio < C.pinchDown && indexExtended && !fist) {
+    penStart(now);
+    lastWipe = null;
+  } else if (fist) {
+    wipeAt(l);
+  } else {
+    lastWipe = null;
+  }
+}
+
+function released(now) {
+  if (!penDown) return;
+  releasedFrames++;
+  if (releasedFrames >= C.releaseFrames && now - lastPinchMs >= C.releaseMs) penDown = false;
+}
+
+// ---------- drawing (erases fog) ----------
+function penStart(now) {
+  penDown = true; releasedFrames = 0; lastPinchMs = now;
+  rawAcc = { x: pinchPt.x, y: pinchPt.y }; penRaw = rawAcc;
+  tgt = { x: pinchPt.x, y: pinchPt.y }; brush = { x: pinchPt.x, y: pinchPt.y };
+  lastPt = { x: pinchPt.x, y: pinchPt.y }; lastMid = { x: pinchPt.x, y: pinchPt.y };
+  star.x = pinchPt.x; star.y = pinchPt.y;
+  fogCtx.globalCompositeOperation = 'destination-out';
+  fogCtx.fillStyle = '#000';
+  fogCtx.beginPath(); fogCtx.arc(brush.x, brush.y, brushPx(), 0, Math.PI * 2); fogCtx.fill();
+  fogCtx.globalCompositeOperation = 'source-over';
+}
+
+function updatePen() {
+  if (!penDown) return;
+  tgt.x += (penRaw.x - tgt.x) * C.penEase1; tgt.y += (penRaw.y - tgt.y) * C.penEase1;
+  brush.x += (tgt.x - brush.x) * C.penEase2; brush.y += (tgt.y - brush.y) * C.penEase2;
+  const mid = { x: (lastPt.x + brush.x) / 2, y: (lastPt.y + brush.y) / 2 };
+  const r = brushPx();
+  fogCtx.globalCompositeOperation = 'destination-out';
+  fogCtx.lineCap = fogCtx.lineJoin = 'round';
+  fogCtx.lineWidth = r * 2;
+  fogCtx.strokeStyle = '#000';
+  fogCtx.shadowColor = '#000'; fogCtx.shadowBlur = r * 0.5;
+  fogCtx.beginPath();
+  fogCtx.moveTo(lastMid.x, lastMid.y);
+  fogCtx.quadraticCurveTo(lastPt.x, lastPt.y, mid.x, mid.y);
+  fogCtx.stroke();
+  fogCtx.shadowBlur = 0;
+  fogCtx.globalCompositeOperation = 'source-over';
+  lastPt = { x: brush.x, y: brush.y }; lastMid = mid;
+}
+
+// ---------- fist wipe ----------
+// Soft round stamp. Smooth falloff (no hard ring) so overlapping stamps blend into one even sweep.
+function stamp(x, y, r, a = C.wipeStamp) {
+  const g = fogCtx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, `rgba(0,0,0,${a})`);
+  g.addColorStop(0.55, `rgba(0,0,0,${a * 0.8})`);
+  g.addColorStop(0.85, `rgba(0,0,0,${a * 0.25})`);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  fogCtx.globalCompositeOperation = 'destination-out';
+  fogCtx.fillStyle = g;
+  fogCtx.fillRect(x - r, y - r, r * 2, r * 2);
+  fogCtx.globalCompositeOperation = 'source-over';
+}
+
+// Dense stamps along a segment, so the wipe is one continuous swathe rather than beads.
+// Returns the new anchor point (where the last stamp landed).
+function sweep(from, to, r, a) {
+  const dx = to.x - from.x, dy = to.y - from.y, d = Math.hypot(dx, dy);
+  const step = Math.max(2 * DPR, r * C.wipeStep);
+  const n = Math.floor(d / step);
+  if (n === 0) return from;
+  const count = Math.min(n, C.wipeMaxStamps);
+  for (let i = 1; i <= count; i++) stamp(from.x + dx / d * step * i, from.y + dy / d * step * i, r, a);
+  return n > C.wipeMaxStamps ? to : { x: from.x + dx / d * step * count, y: from.y + dy / d * step * count };
+}
+
+function wipeAt(l) {
+  const raw = toScreen(l[9]);
+  const handW = Math.max(vdist(l[5], l[17]), vdist(l[0], l[9])) * L.scale;
+  const r = handW * C.wipeScale;
+  if (!lastWipe) { wipeSm = { x: raw.x, y: raw.y }; stamp(raw.x, raw.y, r); lastWipe = { x: raw.x, y: raw.y }; return; }
+  if (Math.hypot(raw.x - wipeSm.x, raw.y - wipeSm.y) > C.wipeJump * W) { // tracking glitch: no streak
+    wipeSm = { x: raw.x, y: raw.y }; stamp(raw.x, raw.y, r); lastWipe = { x: raw.x, y: raw.y }; return;
+  }
+  // low-pass the hand so tracking jitter doesn't scribble the glass
+  wipeSm.x += (raw.x - wipeSm.x) * C.wipeEase; wipeSm.y += (raw.y - wipeSm.y) * C.wipeEase;
+  lastWipe = sweep(lastWipe, wipeSm, r);
+}
+
+// ---------- mouse / touch: drag to wipe ----------
+function pointerXY(e) { return { x: e.clientX * DPR, y: e.clientY * DPR }; }
+function onPointerDown(e) {
+  if (!running || e.target.closest('.dock, .cam-back')) return;
+  pointerLast = pointerXY(e);
+  stamp(pointerLast.x, pointerLast.y, brushPx() * 1.8, 0.5);
+}
+function onPointerMove(e) {
+  if (!running || !pointerLast) return;
+  const p = pointerXY(e);
+  pointerLast = sweep(pointerLast, p, brushPx() * 1.8, 0.28);
+}
+function onPointerUp() { pointerLast = null; }
+
+// ---------- condensation drops ----------
+function fogAlphaAt(x, y) {
+  return fogCtx.getImageData(Math.max(0, Math.min(W - 1, x | 0)), Math.max(0, Math.min(H - 1, y | 0)), 1, 1).data[3];
+}
+function updateDrops() {
+  if (drops.length < C.dropsMax && Math.random() < C.dropSpawn) {
+    const x = Math.random() * W, y = Math.random() * H * 0.65;
+    if (fogAlphaAt(x, y) > 70) {
+      drops.push({ x, y, r: (1.8 + Math.random() * 2.2) * DPR, vy: 0, wait: 30 + Math.random() * 140, grow: 0 });
+    }
+  }
+  fogCtx.globalCompositeOperation = 'destination-out';
+  fogCtx.lineCap = 'round';
+  for (let i = drops.length - 1; i >= 0; i--) {
+    const d = drops[i];
+    if (d.wait > 0) { d.wait--; d.r += 0.012 * DPR; continue; } // gathering water
+    d.vy = Math.min(d.vy + 0.07 * DPR, 2.6 * DPR);
+    if (Math.random() < 0.012) { d.wait = 25 + Math.random() * 70; d.vy = 0; } // catches, pauses
+    const ny = d.y + d.vy, nx = d.x + (Math.random() - 0.5) * 0.35 * DPR;
+    fogCtx.strokeStyle = 'rgba(0,0,0,0.5)';
+    fogCtx.lineWidth = d.r * 1.15;
+    fogCtx.beginPath(); fogCtx.moveTo(d.x, d.y); fogCtx.lineTo(nx, ny); fogCtx.stroke();
+    d.x = nx; d.y = ny; d.r = Math.max(d.r * 0.9995, 1.4 * DPR);
+    d.n = (d.n || 0) + 1;
+    if (d.y > H + 20 || (d.n % 12 === 0 && fogAlphaAt(d.x, d.y) < 12)) drops.splice(i, 1); // ran off, or out into clear glass
+  }
+  fogCtx.globalCompositeOperation = 'source-over';
+}
+function drawDrops() {
+  for (const d of drops) {
+    // body of the drop: a faint lens, a dark lower edge, and a bright specular dot
+    fctx.fillStyle = 'rgba(255,255,255,0.16)';
+    fctx.beginPath(); fctx.ellipse(d.x, d.y, d.r, d.r * 1.25, 0, 0, Math.PI * 2); fctx.fill();
+    fctx.fillStyle = 'rgba(30,25,35,0.22)';
+    fctx.beginPath(); fctx.ellipse(d.x, d.y + d.r * 0.35, d.r * 0.85, d.r * 0.7, 0, 0, Math.PI); fctx.fill();
+    fctx.fillStyle = 'rgba(255,255,255,0.85)';
+    fctx.beginPath(); fctx.arc(d.x - d.r * 0.3, d.y - d.r * 0.4, Math.max(0.8, d.r * 0.28), 0, Math.PI * 2); fctx.fill();
+  }
+}
+
+// ---------- helpers ----------
+let toastTimer = 0;
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('on');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('on'), 6000);
+}
+
+// ---------- breath ----------
+function breathStrength(now) {
+  if (spaceHeld) return 1;
+  let s = 0;
+  if (analyser) {
+    analyser.getFloatTimeDomainData(abuf);
+    let sum = 0;
+    for (let i = 0; i < abuf.length; i++) sum += abuf[i] * abuf[i];
+    const level = Math.sqrt(sum / abuf.length);
+    if (floor === null) floor = level;
+    s = clamp((level - floor - C.breathOn) / (C.breathFull - C.breathOn), 0, 1);
+    floor += (level < floor ? C.floorDown : C.floorUp) * (level - floor);
+  }
+  return now - lastKeyMs < C.keyQuietMs ? 0 : s;
+}
+
+function scatterBreath(strength) {
+  const short = Math.min(W, H), reach = C.reach * short;
+  const cx = fogC.x, cy = fogC.y + C.dropY * short;
+  const al = C.blobAlpha * strength, solid = 1 - C.blobBlur;
+  fogCtx.globalCompositeOperation = 'source-over';
+  for (let i = 0; i < C.blobs; i++) {
+    const ang = Math.random() * Math.PI * 2, dist = Math.sqrt(Math.random()) * reach;
+    const x = cx + Math.cos(ang) * dist * C.spreadX, y = cy + Math.sin(ang) * dist;
+    const r = reach * (0.3 + 0.3 * Math.random());
+    const g = fogCtx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(255,255,255,${al})`);
+    g.addColorStop(solid, `rgba(255,255,255,${al})`);
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    fogCtx.fillStyle = g;
+    fogCtx.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+}
+
+// ---------- render ----------
+function drawMirrored(ctx, k, pad) {
+  ctx.save();
+  ctx.translate(W * k, 0); ctx.scale(-1, 1);
+  ctx.drawImage(video, (L.dx - pad) * k, (L.dy - pad) * k, (L.dw + pad * 2) * k, (L.dh + pad * 2) * k);
+  ctx.restore();
+}
+
+function drawView() {
+  vctx.globalCompositeOperation = 'source-over';
+  drawMirrored(vctx, 1, 0);
+
+  const f = frostCtx;
+  f.globalCompositeOperation = 'source-over';
+  f.clearRect(0, 0, W, H);
+  if (CAN_FILTER) {
+    f.filter = `blur(${C.blur * DPR}px) brightness(${C.brightness})`;
+    drawMirrored(f, 1, 40 * DPR); // overscan so the blur has no transparent rim
+    f.filter = 'none';
+  } else {
+    smallCtx.clearRect(0, 0, smallCanvas.width, smallCanvas.height);
+    drawMirrored(smallCtx, smallCanvas.width / W, 0);
+    f.imageSmoothingEnabled = true; f.imageSmoothingQuality = 'high';
+    f.drawImage(smallCanvas, 0, 0, W, H);
+  }
+  f.fillStyle = C.tint;
+  f.fillRect(0, 0, W, H);
+  f.globalCompositeOperation = 'destination-in'; // keep frost only where fog exists
+  f.drawImage(fogCanvas, 0, 0);
+  f.globalCompositeOperation = 'source-over';
+  vctx.drawImage(frostCanvas, 0, 0);
+}
+
+function drawStar(now) {
+  fctx.clearRect(0, 0, W, H);
+  starA += ((penDown ? 1 : 0) - starA) * 0.25;
+  star.x += (pinchPt.x - star.x) * C.starEase; star.y += (pinchPt.y - star.y) * C.starEase;
+  if (starA < 0.02) return;
+  const R = 8 * DPR;
+  const g = fctx.createRadialGradient(star.x, star.y, 0, star.x, star.y, R * 3.2);
+  g.addColorStop(0, `rgba(255,255,255,${0.7 * starA})`);
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  fctx.fillStyle = g;
+  fctx.fillRect(star.x - R * 3.2, star.y - R * 3.2, R * 6.4, R * 6.4);
+  fctx.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const rr = i % 2 ? R * 0.3 : R, a = i * Math.PI / 4 + now * 0.0005;
+    const px = star.x + Math.cos(a) * rr, py = star.y + Math.sin(a) * rr;
+    i ? fctx.lineTo(px, py) : fctx.moveTo(px, py);
+  }
+  fctx.closePath();
+  fctx.fillStyle = `rgba(255,255,255,${starA})`;
+  fctx.fill();
+}
+
+function frame(now) {
+  if (!running) return;
+  rafId = requestAnimationFrame(frame);
+  frameN++;
+  layout();
+  pumpTrackers();
+
+  fogC.x += (mouth.x - fogC.x) * C.faceEase;
+  fogC.y += (mouth.y - fogC.y) * C.faceEase;
+
+  const strength = breathStrength(now);
+  const busy = penDown || lastWipe !== null; // don't fog while someone is drawing or wiping
+  if (strength > 0 && !busy && frameN % 2 === 0) scatterBreath(strength);
+
+  updatePen();
+  updateDrops();
+  drawView();
+  drawStar(now);
+  drawDrops();
+}
+
+// ---------- save ----------
+function savePng() {
+  view.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'fog-' + new Date().toISOString().replace(/[:.]/g, '-') + '.png';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }, 'image/png');
+  const fl = $('flash'); fl.classList.remove('pop'); void fl.offsetWidth; fl.classList.add('pop');
+}
+
+// ---------- wiring ----------
+$('go').addEventListener('click', start);
+$('shutter').addEventListener('click', savePng);
+$('back').addEventListener('click', stop);
+$('clear').addEventListener('click', resetFog);
+$('tips').addEventListener('click', () => {
+  const lg = $('legend'); lg.hidden = !lg.hidden;
+  $('tips').setAttribute('aria-pressed', String(!lg.hidden));
+});
+window.addEventListener('pointerdown', onPointerDown);
+window.addEventListener('pointermove', onPointerMove);
+window.addEventListener('pointerup', onPointerUp);
+window.addEventListener('pointercancel', onPointerUp);
+window.addEventListener('resize', resize);
+window.addEventListener('blur', () => { spaceHeld = false; });
+
+window.addEventListener('keydown', e => {
+  if (!running) return;
+  if (e.code === 'Space') { e.preventDefault(); spaceHeld = true; return; }
+  lastKeyMs = performance.now();
+  if (e.code === 'KeyC') resetFog();
+  else if (e.code === 'KeyS') savePng();
+  else if (e.code === 'Escape') stop();
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') { spaceHeld = false; e.preventDefault(); }
+  lastKeyMs = performance.now();
+});
+
+// Surface runtime errors on screen (they still reach the console).
+function banner(msg) { const b = $('banner'); b.textContent = msg; b.style.display = 'block'; }
+window.addEventListener('error', e => banner('Error: ' + e.message));
+window.addEventListener('unhandledrejection', e => banner('Error: ' + ((e.reason && e.reason.message) || e.reason)));
+
+resize();
+if (location.protocol === 'file:') {
+  $('startMsg').innerHTML = 'Opened as a file. The camera needs https or localhost. Run <code>python -m http.server</code> in this folder and open <code>http://localhost:8000/fog.html</code>.';
+}
+</script>
+</body>
+</html>

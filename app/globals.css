@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+/* Burgundy ground, bubblegum ink. Flat colour only. Fonts: Barlow Condensed (display) + Barlow (text). */
+:root {
+  --background: #3d0012;
+  --foreground: #ff99d3;
+  --ink: #ff99d3;
+  --muted: #c77aa0;
+  --display: var(--font-display), "Arial Narrow", "Roboto Condensed", Impact, sans-serif;
+  --ease: cubic-bezier(.2, .7, .2, 1);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-text), system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-display: var(--font-display), "Arial Narrow", Impact, sans-serif;
+}
+
+body {
+  background: #3d0012;
+  color: #ff99d3;
+  font-family: var(--font-text), system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: var(--accent, #ff99d3); color: #3d0012; }
+:focus-visible { outline: 3px solid var(--accent, #ff99d3); outline-offset: 3px; }
+
+@keyframes flash {
+  from { opacity: 0.9; }
+  to { opacity: 0; }
+}
